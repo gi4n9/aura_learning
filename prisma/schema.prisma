@@ -1,0 +1,491 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ================= ENUMS =================
+enum UserRole {
+  STUDENT
+  INSTRUCTOR
+  ADMIN
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  ESSAY
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum PublishStatus {
+  ARCHIVED
+  DRAFT
+  PUBLISHED
+}
+
+enum PurchaseStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+// ================= 1. IDENTITY & ACCESS =================
+
+// Profile map 1-1 với Supabase Auth User
+model Profile {
+  id           String   @id @default(uuid()) // Link với auth.users.id của Supabase
+  email        String   @unique
+  fullName     String?
+  avatarUrl    String?
+  role         UserRole @default(STUDENT)
+  interests    String[] @default([]) // Selected categories e.g. ["backend", "frontend"]
+  learningPath Json? // Generated roadmap data
+
+  // Quan hệ Organization (Trường học/Trung tâm)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  // Quan hệ ngược
+  coursesCreated Course[]        @relation("InstructorCourses")
+  enrollments    Enrollment[]
+  studyPlans     StudyPlanItem[]
+  submissions    Submission[]
+  chatSessions   ChatSession[]
+  videoProgress  VideoProgress[]
+  quizResults    QuizResult[]
+
+  // Chat Relations
+  // Chat Relations
+  directMessagesSent         DirectMessage[]
+  conversationParticipations ConversationParticipant[]
+
+  // NEW: Study Schedules Config
+  studySchedules StudySchedule[]
+
+  // Payment History
+  purchases Purchase[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Tổ chức (Trường học, Trung tâm)
+model Organization {
+  id          String  @id @default(uuid())
+  name        String
+  description String?
+  logoUrl     String?
+
+  members Profile[]
+  courses Course[]
+
+  createdAt DateTime @default(now())
+}
+
+// ================= 2. COURSE MANAGEMENT =================
+
+model Course {
+  id           String       @id @default(uuid())
+  title        String
+  description  String?
+  thumbnailUrl String?
+  price        Decimal      @default(0)
+  isFree       Boolean      @default(true) // Helper flag: true if price == 0
+  status       CourseStatus @default(DRAFT)
+
+  // Ai sở hữu khóa học này?
+  instructorId String
+  instructor   Profile @relation("InstructorCourses", fields: [instructorId], references: [id])
+
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  // Phân loại
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  // Nội dung
+  chapters    Chapter[]
+  enrollments Enrollment[]
+  quizResults QuizResult[]
+  purchases   Purchase[]
+
+  // NEW: Relation to Study Schedule
+  includedInSchedules StudyScheduleCourse[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Chapter {
+  id       String        @id @default(uuid())
+  title    String
+  courseId String
+  course   Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  lessons  Lesson[]
+  status   PublishStatus @default(DRAFT)
+  position Int // Để sắp xếp thứ tự chương
+}
+
+model Lesson {
+  id        String  @id @default(uuid())
+  title     String
+  chapterId String
+  chapter   Chapter @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  position  Int
+
+  youtubeVideoId String?
+  duration       Int?
+  transcript     String?     @db.Text
+  mindMapData    Json? // GIỮ LẠI: Lưu JSON cho đồ họa Mindmap của React Flow
+  flashcards     Flashcard[]
+
+  timeline     Json?
+  translations Json?
+  questions    Question[]
+
+  studyPlanItems  StudyPlanItem[]
+  videoProgress   VideoProgress[]
+  quizResults     QuizResult[]
+  videoEmbeddings VideoEmbedding[]
+
+  createdAt DateTime @default(now())
+}
+
+// ================= FLASHCARDS (BẢNG ĐỘC LẬP) =================
+model Flashcard {
+  id       String @id @default(uuid())
+  lessonId String
+  lesson   Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  front     String @db.Text
+  back      String @db.Text
+  timestamp Int? // Thời điểm xuất hiện trong video (giây)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([lessonId]) // Đánh index để truy vấn theo bài học cực nhanh
+}
+
+// ================= VIDEO PROGRESS TRACKING =================
+model VideoProgress {
+  id String @id @default(uuid())
+
+  userId String
+  user   Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  lessonId String
+  lesson   Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  // Progress data
+  currentTime Int     @default(0) // Thời điểm hiện tại (giây)
+  duration    Int     @default(0) // Tổng thời lượng video (giây)
+  percentage  Float   @default(0) // % đã xem (0-100)
+  isCompleted Boolean @default(false) // Đã xem xong (>= 90%)
+
+  lastWatchedAt DateTime @default(now()) // Lần cuối xem
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, lessonId]) // Mỗi user chỉ có 1 record per lesson
+  @@index([userId])
+  @@index([lessonId])
+}
+
+model Question {
+  id       String @id @default(uuid())
+  lessonId String
+  lesson   Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  content   String       @db.Text // Nội dung câu hỏi
+  timestamp Int? // Thời điểm xuất hiện trong video (giây). Null nếu là bài tập cuối bài.
+  type      QuestionType
+
+  // Cho trắc nghiệm
+  options       Json? // Mảng các lựa chọn ["A...", "B..."]
+  correctAnswer String? // Đáp án đúng
+
+  // Cho AI
+  aiExplanation String? // Giải thích của AI cho đáp án đúng/gợi ý chấm điểm
+
+  isArchived  Boolean      @default(false)
+  submissions Submission[]
+  createdAt   DateTime     @default(now())
+}
+
+// ================= 2.1 CATEGORIES =================
+model Category {
+  id          String  @id @default(uuid())
+  name        String // Tên danh mục (Ví dụ: "Lập trình", "Ngoại ngữ")
+  slug        String  @unique // URL friendly (ví dụ: "lap-trinh", "ngoai-ngu")
+  description String?
+  icon        String? // Icon/Image URL
+
+  // Hierarchy (Danh mục cha - con)
+  parentId String?
+  parent   Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryHierarchy")
+
+  // Courses in this category
+  courses Course[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ================= 3. LEARNING & INTERACTION =================
+
+// Ghi nhận việc mua/đăng ký khóa học
+model Enrollment {
+  id       String  @id @default(uuid())
+  userId   String
+  user     Profile @relation(fields: [userId], references: [id])
+  courseId String
+  course   Course  @relation(fields: [courseId], references: [id])
+
+  progress Int      @default(0) // % hoàn thành
+  joinedAt DateTime @default(now())
+
+  @@unique([userId, courseId])
+}
+
+// Giao dịch mua bán (Payment History)
+model Purchase {
+  id     String  @id @default(uuid())
+  userId String
+  user   Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  courseId String
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  amount   Decimal // Số tiền thực trả
+  currency String  @default("VND") // VND, USD
+
+  // Payment Gateway Info
+  provider      String         @default("STRIPE") // STRIPE, VNPAY, MOMO
+  transactionId String? // Transaction ID từ cổng thanh toán (ví dụ: Stripe Payment Intent ID)
+  status        PurchaseStatus @default(PENDING)
+
+  errorLog String? // Lưu lỗi nếu có
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([courseId])
+}
+
+// Lịch học (Study Plan) - INDIVIDUAL ITEMS
+model StudyPlanItem {
+  id     String  @id @default(uuid())
+  userId String
+  user   Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  lessonId String
+  lesson   Lesson @relation(fields: [lessonId], references: [id])
+
+  // Link to parent schedule if needed, but keeping it loose is also fine
+  studyScheduleId String?
+  studySchedule   StudySchedule? @relation(fields: [studyScheduleId], references: [id])
+
+  scheduledAt DateTime // Thời gian user dự kiến học
+  isCompleted Boolean   @default(false)
+  completedAt DateTime? // Thời điểm hoàn thành bài học (dùng tính thống kê tuần/tháng)
+
+  // Dùng để hiển thị trên UI Calendar
+  note String?
+}
+
+// NEW: STUDY SCHEDULE CONFIGURATION (One user can have multiple "Plans" e.g. "Summer Plan", "Exam Prep")
+model StudySchedule {
+  id     String  @id @default(uuid())
+  userId String
+  user   Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String // e.g., "Fullstack Roadmap"
+
+  // Preferences
+  startDate     DateTime
+  targetEndDate DateTime?
+
+  // Days of week available: [1, 3, 5] (Mon, Wed, Fri) stored as Int[] is tricky in Postgres w/ Prisma arrays sometimes, using simple version or JSON
+  // Or just "1,3,5" string
+  availableDays Int[]
+
+  dailyLearningMinutes Int? // e.g. 60
+
+  // Status
+  isActive Boolean @default(true)
+
+  // Relations
+  courses StudyScheduleCourse[]
+  items   StudyPlanItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model StudyScheduleCourse {
+  studyScheduleId String
+  studySchedule   StudySchedule @relation(fields: [studyScheduleId], references: [id], onDelete: Cascade)
+
+  courseId String
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  priority Int? // Order to learn: 1, 2, 3
+
+  @@id([studyScheduleId, courseId])
+}
+
+// Bài làm của học sinh
+model Submission {
+  id     String  @id @default(uuid())
+  userId String
+  user   Profile @relation(fields: [userId], references: [id])
+
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id])
+
+  answerText String? @db.Text // Câu trả lời text
+  fileUrl    String? // Link bài tập upload lên Supabase Storage
+
+  // AI Grading
+  score    Float? // Điểm số do AI chấm
+  feedback String?   @db.Text // Nhận xét chi tiết của AI
+  gradedAt DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+// Tổng hợp kết quả làm bài tập của học viên theo từng bài học
+model QuizResult {
+  id     String  @id @default(uuid())
+  userId String
+  user   Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  lessonId String
+  lesson   Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  // Denormalize để query nhanh theo khóa học
+  courseId String
+  course   Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  score          Float   @default(0) // Điểm số (0-100 hoặc theo thang điểm)
+  totalQuestions Int     @default(0)
+  correctAnswers Int     @default(0)
+  isPassed       Boolean @default(false) // Đạt yêu cầu hay chưa
+
+  attemptCount Int @default(1) // Số lần làm bài
+
+  lastAttemptAt DateTime @default(now())
+
+  @@unique([userId, lessonId]) // Mỗi user chỉ lưu 1 kết quả tổng hợp cho 1 bài học
+  @@index([courseId])
+  @@index([userId])
+}
+
+// ================= 4. AI CHAT & MEMORY =================
+
+model ChatSession {
+  id     String  @id @default(uuid())
+  userId String
+  user   Profile @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Context: Chat này về khóa học/bài học nào? (Optional)
+  courseId String? // Nếu null thì là chat general, nếu có thì AI load context khóa học đó
+  lessonId String? // Lịch sử đoạn chat cụ thể gắn liền với bài học nào
+
+  title    String? // Tên đoạn hội thoại (Auto generate bởi AI)
+  messages Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Message {
+  id        String      @id @default(uuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  role    String // 'user' hoặc 'assistant'
+  content String @db.Text
+
+  // Token usage tracking (Optional nhưng tốt cho quản lý chi phí)
+  tokensUsed Int?
+
+  createdAt DateTime @default(now())
+}
+
+// ================= 5. USER CHAT (MESSENGER STYLE) =================
+
+model Conversation {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  participants ConversationParticipant[]
+  messages     DirectMessage[]
+}
+
+model ConversationParticipant {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           Profile      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  hasSeenLatest Boolean @default(false)
+
+  @@unique([conversationId, userId])
+}
+
+model DirectMessage {
+  id      String  @id @default(uuid())
+  content String  @db.Text
+  fileUrl String?
+
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  senderId String
+  sender   Profile @relation(fields: [senderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deleted Boolean @default(false)
+
+  @@index([conversationId])
+  @@index([senderId])
+}
+
+// ================= 6. VECTOR SEARCH =================
+model VideoEmbedding {
+  id       String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  lessonId String @map("lesson_id")
+  lesson   Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  content   String @db.Text
+  startTime Float  @map("start_time")
+  endTime   Float  @map("end_time")
+
+  // Unsupported type for vector, handle via raw SQL or Supabase client
+  embedding Unsupported("vector(3072)")?
+
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("video_embeddings")
+}
